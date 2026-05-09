@@ -1,0 +1,330 @@
+import argparse
+from typing import List
+from PIL import Image, ImageOps
+import numpy as np
+import cv2
+import tensorflow as tf
+import time
+from collections import deque
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Injury detection via webcam.")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index.")
+    parser.add_argument("--model", default="keras_model.h5", help="Path to Keras model.")
+    parser.add_argument("--labels", default="labels.txt", help="Path to labels file.")
+    parser.add_argument("--window", default="Injury Detection", help="OpenCV window title.")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.5,
+        help="Minimum seconds between inferences.",
+    )
+    parser.add_argument(
+        "--min-conf",
+        type=float,
+        default=0.6,
+        help="Minimum confidence to accept a prediction.",
+    )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=5,
+        help="Number of recent predictions to smooth.",
+    )
+    parser.add_argument(
+        "--prob-smooth-window",
+        type=int,
+        default=5,
+        help="Number of recent probability vectors to average.",
+    )
+    parser.add_argument(
+        "--min-margin",
+        type=float,
+        default=0.05,
+        help="Minimum margin between top-1 and top-2 probabilities.",
+    )
+    parser.add_argument(
+        "--hysteresis",
+        type=int,
+        default=2,
+        help="Consecutive predictions required to switch classes.",
+    )
+    parser.add_argument(
+        "--adaptive-threshold",
+        action="store_true",
+        help="Dynamically adjust confidence threshold.",
+    )
+    parser.add_argument(
+        "--adaptive-target",
+        type=float,
+        default=0.7,
+        help="Target confirmed ratio for adaptive thresholding.",
+    )
+    parser.add_argument(
+        "--adaptive-window",
+        type=int,
+        default=20,
+        help="Window size for adaptive thresholding.",
+    )
+    parser.add_argument(
+        "--adaptive-step",
+        type=float,
+        default=0.02,
+        help="Adjustment step for adaptive thresholding.",
+    )
+    parser.add_argument(
+        "--adaptive-min",
+        type=float,
+        default=0.3,
+        help="Minimum adaptive threshold.",
+    )
+    parser.add_argument(
+        "--adaptive-max",
+        type=float,
+        default=0.9,
+        help="Maximum adaptive threshold.",
+    )
+    return parser.parse_args()
+
+
+def load_labels(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle.readlines() if line.strip()]
+    return lines
+
+
+def preprocess_frame(frame: np.ndarray) -> np.ndarray:
+    # Convert BGR -> RGB and use PIL pipeline to match TM2 preprocessing.
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb)
+    size = (224, 224)
+    image = ImageOps.fit(image, size, Image.LANCZOS)
+    image_array = np.asarray(image)
+    normalized_image_array = (image_array.astype(np.float32) / 127.0) - 1
+    data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
+    data[0] = normalized_image_array
+    return data
+
+
+def draw_panel(overlay: np.ndarray, title: str, x: int, y: int, w: int, h: int) -> None:
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (20, 20, 20), -1)
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (80, 80, 80), 1)
+    cv2.putText(
+        overlay,
+        title,
+        (x + 10, y + 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (230, 230, 230),
+        2,
+    )
+
+
+def draw_conf_bar(overlay: np.ndarray, x: int, y: int, w: int, h: int, value: float) -> None:
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (60, 60, 60), 1)
+    fill_w = int(max(0.0, min(1.0, value)) * (w - 2))
+    cv2.rectangle(overlay, (x + 1, y + 1), (x + 1 + fill_w, y + h - 1), (0, 180, 255), -1)
+
+
+def smooth_prediction(history: deque, num_classes: int) -> int:
+    counts = np.zeros(num_classes, dtype=np.int32)
+    for idx in history:
+        if 0 <= idx < num_classes:
+            counts[idx] += 1
+    if counts.sum() == 0:
+        return -1
+    return int(np.argmax(counts))
+
+
+def main() -> None:
+    args = parse_args()
+    np.set_printoptions(suppress=True)
+
+    model = tf.keras.models.load_model(args.model)
+    class_names = load_labels(args.labels)
+    num_classes = len(class_names)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    color = (255, 255, 0)
+    thickness = 2
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open camera index {args.camera}.")
+
+    last_infer_time = 0.0
+    last_class = "Unknown"
+    last_index = -1
+    last_confidence = 0.0
+    last_status = "Warming up..."
+    frame_count = 0
+    fps_window_start = time.time()
+    fps_value = 0.0
+    pred_history = deque(maxlen=max(1, args.smooth_window))
+    prob_history = deque(maxlen=max(1, args.prob_smooth_window))
+    min_conf_current = args.min_conf
+    confirm_history = deque(maxlen=max(1, args.adaptive_window))
+    stable_class = -1
+    last_pred = -1
+    pred_streak = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+
+            now = time.time()
+            if now - last_infer_time >= args.interval:
+                data = preprocess_frame(frame)
+
+                prediction = model.predict(data, verbose=0)
+                probs = prediction[0]
+                prob_history.append(probs)
+                avg_probs = np.mean(np.stack(prob_history, axis=0), axis=0)
+
+                ynew = int(np.argmax(avg_probs))
+                last_confidence = float(avg_probs[ynew])
+                last_infer_time = now
+                pred_history.append(ynew)
+
+                smooth_idx = smooth_prediction(pred_history, num_classes)
+                if smooth_idx >= 0:
+                    ynew = smooth_idx
+                    last_confidence = float(avg_probs[ynew])
+
+                # Hysteresis: require N consecutive predictions before switching
+                if ynew == last_pred:
+                    pred_streak += 1
+                else:
+                    last_pred = ynew
+                    pred_streak = 1
+
+                if args.hysteresis <= 1 or pred_streak >= args.hysteresis:
+                    stable_class = ynew
+
+                last_index = stable_class if stable_class >= 0 else ynew
+                if ynew < len(class_names):
+                    last_class = class_names[ynew]
+                else:
+                    last_class = f"{ynew}"
+
+                sorted_probs = np.sort(avg_probs)
+                margin = float(sorted_probs[-1] - sorted_probs[-2]) if len(sorted_probs) >= 2 else 1.0
+                reject = (last_confidence < min_conf_current) or (margin < args.min_margin)
+
+                if reject:
+                    last_status = "Uncertain"
+                else:
+                    last_status = "Confirmed"
+
+                confirm_history.append(not reject)
+                if args.adaptive_threshold and len(confirm_history) == confirm_history.maxlen:
+                    confirmed_ratio = sum(confirm_history) / len(confirm_history)
+                    if confirmed_ratio > args.adaptive_target:
+                        min_conf_current = min(args.adaptive_max, min_conf_current + args.adaptive_step)
+                    elif confirmed_ratio < args.adaptive_target:
+                        min_conf_current = max(args.adaptive_min, min_conf_current - args.adaptive_step)
+
+                print(f"Class: {last_class} Confidence Score: {last_confidence:.4f}")
+
+            frame_count += 1
+            elapsed = now - fps_window_start
+            if elapsed >= 1.0:
+                fps_value = frame_count / elapsed
+                fps_window_start = now
+                frame_count = 0
+
+            h, w = frame.shape[:2]
+            panel_w = 320
+            panel_h = 190
+            panel_x = w
+            panel_y = 0
+            canvas = np.zeros((h, w + panel_w, 3), dtype=np.uint8)
+            canvas[:, :w] = frame
+            overlay = canvas
+            draw_panel(overlay, "Injury Detection", panel_x + 10, panel_y + 10, panel_w - 20, panel_h)
+
+            is_background = False
+            label_lower = last_class.strip().lower()
+            if last_index == 0:
+                is_background = True
+            elif "background" in label_lower:
+                is_background = True
+            elif label_lower.startswith("0 "):
+                is_background = True
+
+            if is_background:
+                display_class = "No injury"
+                display_status = "Clear"
+            else:
+                display_class = last_class
+                display_status = last_status
+
+            cv2.putText(
+                overlay,
+                f"Status: {display_status}",
+                (panel_x + 20, panel_y + 70),
+                font,
+                font_scale,
+                (255, 255, 255),
+                2,
+            )
+            cv2.putText(
+                overlay,
+                f"Class: {display_class}",
+                (panel_x + 20, panel_y + 105),
+                font,
+                font_scale,
+                color,
+                2,
+            )
+            cv2.putText(
+                overlay,
+                f"FPS: {fps_value:.1f}",
+                (panel_x + 20, panel_y + 140),
+                font,
+                font_scale,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                overlay,
+                f"Conf: {last_confidence:.2f}",
+                (panel_x + 20, panel_y + 170),
+                font,
+                font_scale,
+                (0, 255, 255),
+                2,
+            )
+            draw_conf_bar(overlay, panel_x + 130, panel_y + 158, 160, 12, last_confidence)
+
+            legend_y = h - 20
+            cv2.putText(
+                overlay,
+                "Q: Quit | Thr: {0:.2f} | Smooth: {1} | Hys: {2}".format(
+                    min_conf_current,
+                    args.smooth_window,
+                    args.hysteresis,
+                ),
+                (panel_x + 20, legend_y),
+                font,
+                0.6,
+                (220, 220, 220),
+                2,
+            )
+            cv2.imshow(args.window, overlay)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+
